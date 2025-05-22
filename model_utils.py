@@ -1,15 +1,11 @@
 import torch
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
+import random
+import numpy as np
+from config import SEED
 
-feature_maps = {}
-
-def register_feature_hook(model):
-    def hook_fn(module, input, output):
-        output.retain_grad()
-        feature_maps['feat'] = output
-    handle = model.backbone.body.layer4.register_forward_hook(hook_fn)
-    return handle
-
-def load_model(device='cpu'):
-    model = fasterrcnn_resnet50_fpn(pretrained=True).eval().to(device)
-    return model
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)

@@ -1,20 +1,23 @@
 import torch
+import torch.nn.functional as F
+from config import DEVICE
 
-def iterative_semantic_attack(model, img_tensor, num_iters=10, epsilon=0.005, feature_maps=None):
-    adv_img = img_tensor.clone().detach().requires_grad_(True)
-
-    for i in range(num_iters):
-        feature_maps.clear()
-        outputs = model(adv_img)
-
-        scores = outputs[0]['scores']
-        adv_loss = -torch.sum(scores) if len(scores) > 0 else torch.tensor(0.0, requires_grad=True)
-
+def semantic_flow_attack(model, image, label, epsilon=0.03, steps=10, alpha=0.005):
+    perturbed = image.clone().detach().to(DEVICE)
+    perturbed.requires_grad = True
+    
+    for _ in range(steps):
+        output = model(perturbed)
+        loss = F.cross_entropy(output, label)
         model.zero_grad()
-        adv_loss.backward()
+        loss.backward()
 
-        grad = adv_img.grad
-        adv_img = adv_img + epsilon * torch.sign(grad)
-        adv_img = torch.clamp(adv_img, 0, 1).detach().requires_grad_(True)
+        grad_sign = perturbed.grad.sign()
+        perturbed = perturbed + alpha * grad_sign
 
-    return adv_img.detach()
+        # Clip and project to epsilon ball
+        perturbed = torch.clamp(perturbed, image - epsilon, image + epsilon)
+        perturbed = torch.clamp(perturbed, 0, 1).detach()
+        perturbed.requires_grad = True
+
+    return perturbed

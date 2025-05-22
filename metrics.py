@@ -1,148 +1,89 @@
 import torch
-import torch.nn.functional as Fnn
+import torch.nn.functional as F
+from torchvision import transforms
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from PIL import Image
+import lpips
 import numpy as np
-from torchvision.transforms.functional import to_pil_image
-from skimage.metrics import structural_similarity as ssim
-from scipy.stats import entropy as kl_divergence
-import lpips  # Learned perceptual metric
-import cv2
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity, mean_squared_error
 
-# ------------------------------
-# 1. Feature-Level Metrics
-# ------------------------------
+# ---------------- CONFIG ----------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+lpips_model = lpips.LPIPS(net='alex').to(device)
 
-def l2_feature_distance(f1, f2):
+# ---------------- LOAD MODEL ----------------
+model = fasterrcnn_resnet50_fpn(weights="DEFAULT").eval().to(device)
+
+# ---------------- LOAD IMAGES ----------------
+original_path = "dog.jpg"
+attacked_path = "test_images/attacked.jpg"
+
+original_img = Image.open(original_path).convert('RGB')
+attacked_img = Image.open(attacked_path).convert('RGB')
+
+transform = transforms.ToTensor()
+orig_tensor = transform(original_img).unsqueeze(0).to(device)
+adv_tensor = transform(attacked_img).unsqueeze(0).to(device)
+
+# For LPIPS (needs [-1, 1] range)
+orig_lpips = (orig_tensor * 2) - 1
+adv_lpips = (adv_tensor * 2) - 1
+
+# ---------------- HOOK FOR FEATURES ----------------
+feature_maps = {}
+def hook_fn(module, input, output):
+    feature_maps['features'] = output
+
+hook = model.backbone.body.layer4.register_forward_hook(hook_fn)
+
+# ---------------- FORWARD PASS ----------------
+with torch.no_grad():
+    _ = model(orig_tensor)
+    f_orig = feature_maps['features'].detach()
+    _ = model(adv_tensor)
+    f_adv = feature_maps['features'].detach()
+
+hook.remove()
+
+# ---------------- METRICS ----------------
+def cosine_similarity(f1, f2):
+    return F.cosine_similarity(f1.view(-1), f2.view(-1), dim=0).item()
+
+def l2_distance(f1, f2):
     return torch.norm(f1 - f2).item()
-
-def cosine_feature_similarity(f1, f2):
-    return Fnn.cosine_similarity(f1.view(-1), f2.view(-1), dim=0).item()
 
 def semantic_drift(delta):
     return delta.abs().mean().item()
 
+def lpips_score(img1, img2):
+    return lpips_model(img1, img2).item()
 
-# ------------------------------
-# 2. Image-Level (Perceptual)
-# ------------------------------
+def psnr_score(img1, img2):
+    img1_np = img1.squeeze().permute(1,2,0).cpu().numpy()
+    img2_np = img2.squeeze().permute(1,2,0).cpu().numpy()
+    return peak_signal_noise_ratio(img1_np, img2_np, data_range=1.0)
 
-def compute_ssim(img1, img2):
-    img1_np = img1.squeeze().permute(1, 2, 0).cpu().numpy()
-    img2_np = img2.squeeze().permute(1, 2, 0).cpu().numpy()
-    return ssim(img1_np, img2_np, multichannel=True, data_range=1.0)
+def ssim_score(img1, img2):
+    img1_np = img1.squeeze().permute(1,2,0).cpu().numpy()
+    img2_np = img2.squeeze().permute(1,2,0).cpu().numpy()
+    return structural_similarity(img1_np, img2_np, multichannel=True, data_range=1.0)
 
-def pixel_l2_dist(img1, img2):
-    return torch.norm(img1 - img2).item()
+def mse_score(img1, img2):
+    img1_np = img1.squeeze().permute(1,2,0).cpu().numpy()
+    img2_np = img2.squeeze().permute(1,2,0).cpu().numpy()
+    return mean_squared_error(img1_np, img2_np)
 
-def psnr(img1, img2):
-    mse = Fnn.mse_loss(img1, img2).item()
-    if mse == 0:
-        return float('inf')
-    return 20 * np.log10(1.0 / np.sqrt(mse))
+# ---------------- FINAL REPORT ----------------
+metrics = {
+    "Cosine Similarity": cosine_similarity(f_orig, f_adv),
+    "L2 Distance": l2_distance(f_orig, f_adv),
+    "Semantic Drift": semantic_drift(f_orig - f_adv),
+    "LPIPS": lpips_score(orig_lpips, adv_lpips),
+    "PSNR": psnr_score(orig_tensor, adv_tensor),
+    "SSIM": ssim_score(orig_tensor, adv_tensor),
+    "MSE": mse_score(orig_tensor, adv_tensor)
+}
 
-def lpips_distance(lpips_fn, img1, img2):
-    return lpips_fn(img1, img2).item()
-
-
-# ------------------------------
-# 3. Prediction-Level
-# ------------------------------
-
-def attack_success_rate(outputs_orig, outputs_adv, threshold=0.5):
-    def extract_labels(outputs):
-        return set([label.item() for label, score in zip(outputs[0]['labels'], outputs[0]['scores']) if score > threshold])
-    orig_labels = extract_labels(outputs_orig)
-    adv_labels = extract_labels(outputs_adv)
-    suppressed = orig_labels - adv_labels
-    return len(suppressed) / len(orig_labels) if orig_labels else 0.0
-
-
-# ------------------------------
-# 4. Statistical Drift
-# ------------------------------
-
-def histogram_kl_divergence(img1, img2, bins=256):
-    img1_np = img1.squeeze().cpu().numpy().flatten()
-    img2_np = img2.squeeze().cpu().numpy().flatten()
-    hist1, _ = np.histogram(img1_np, bins=bins, range=(0, 1), density=True)
-    hist2, _ = np.histogram(img2_np, bins=bins, range=(0, 1), density=True)
-    hist1 += 1e-10
-    hist2 += 1e-10
-    return kl_divergence(hist1, hist2)
-
-
-# ------------------------------
-# 5. Multi-layer Feature Analysis
-# ------------------------------
-
-def multi_layer_feature_metrics(feat_dict_orig, feat_dict_adv):
-    metrics = {}
-    for layer in feat_dict_orig:
-        f1, f2 = feat_dict_orig[layer], feat_dict_adv[layer]
-        delta = f1 - f2
-        metrics[f'{layer}_L2'] = l2_feature_distance(f1, f2)
-        metrics[f'{layer}_Cosine'] = cosine_feature_similarity(f1, f2)
-        metrics[f'{layer}_Drift'] = semantic_drift(delta)
-    return metrics
-
-
-# ------------------------------
-# Normalize Metrics (for plots)
-# ------------------------------
-
-def normalize_metrics(metric_dict):
-    # Min-max normalization assuming typical ranges
-    normalized = {}
-    bounds = {
-        "L2 Feature Dist": (0, 10),
-        "Cosine Similarity": (0.5, 1.0),
-        "Semantic Drift": (0, 0.1),
-        "Pixel L2 Dist": (0, 0.05),
-        "SSIM": (0.5, 1.0),
-        "PSNR": (10, 50),
-        "KL Divergence": (0, 1),
-        "LPIPS": (0, 0.5),
-        "Suppression Rate": (0, 1)
-    }
-
-    for k, v in metric_dict.items():
-        low, high = bounds.get(k, (0, 1))
-        v_clamped = min(max(v, low), high)
-        norm = (v_clamped - low) / (high - low) if high != low else 0
-        normalized[k] = norm
-    return normalized
-
-
-# ------------------------------
-# Unified Evaluation Function
-# ------------------------------
-
-def evaluate_attack_all(
-    original_tensor,
-    adv_tensor,
-    feat_dict_orig,
-    feat_dict_adv,
-    outputs_orig=None,
-    outputs_adv=None,
-    lpips_fn=None
-):
-    results = {}
-
-    # Feature-level
-    results.update(multi_layer_feature_metrics(feat_dict_orig, feat_dict_adv))
-
-    # Pixel & perceptual
-    results['Pixel L2 Dist'] = pixel_l2_dist(original_tensor, adv_tensor)
-    results['SSIM'] = compute_ssim(original_tensor, adv_tensor)
-    results['PSNR'] = psnr(original_tensor, adv_tensor)
-
-    if lpips_fn:
-        results['LPIPS'] = lpips_distance(lpips_fn, original_tensor, adv_tensor)
-
-    # Statistical
-    results['KL Divergence'] = histogram_kl_divergence(original_tensor, adv_tensor)
-
-    # Suppression Rate
-    if outputs_orig and outputs_adv:
-        results['Suppression Rate'] = attack_success_rate(outputs_orig, outputs_adv)
-
-    return results, normalize_metrics(results)
+print("\n--- Evaluation Metrics Report ---")
+for k, v in metrics.items():
+    print(f"{k}: {v:.4f}")
